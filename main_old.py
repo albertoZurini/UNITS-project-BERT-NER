@@ -109,6 +109,29 @@ def training_step(dataset, model, optimizer, loss_fn, tokenizer, device):
         optimizer.step()
     return epoch_loss
 
+class TweetDataset(torch.utils.data.Dataset):
+    """
+    Class to store the tweet data as PyTorch Dataset
+    """
+    
+    def __init__(self, encodings, attention_masks, labels):
+        self.encodings = encodings
+        self.attention_masks = attention_masks
+        self.labels = labels
+        
+    def __getitem__(self, idx):
+        # an encoding can have keys such as input_ids and attention_mask
+        # item is a dictionary which has the same keys as the encoding has
+        # and the values are the idxth value of the corresponding key (in PyTorch's tensor format)
+        item = {} #{key: torch.tensor(val) for key, val in self.encodings[idx].items()}
+        item["document"] = torch.tensor(self.encodings[idx])
+        item["attention_mask"] = torch.tensor(self.attention_masks[idx])
+        item['labels'] = torch.tensor(self.labels[idx])
+        return item
+    
+    def __len__(self):
+        return len(self.labels)
+
 # Example usage:
 if __name__ == "__main__":
     model_name = "answerdotai/ModernBERT-base"  # or any other pretrained model
@@ -135,7 +158,7 @@ if __name__ == "__main__":
                         ) for j in range(len(dataset["train"]))]
     
     input_ids = [ti["input_ids"] for ti in tokenized_inputs]
-    attention_mask = [ti["attention_mask"] for ti in tokenized_inputs]
+    attention_masks = [ti["attention_mask"] for ti in tokenized_inputs]
 
     labels = []
 
@@ -145,7 +168,8 @@ if __name__ == "__main__":
         labels.append(label)
 
     # train_loader = DataLoader(dataset["train"], batch_size=10, shuffle=True)
-    tensorDataset = TensorDataset(input_ids, attention_mask, labels)
+    # tensorDataset = TensorDataset(input_ids, attention_mask, labels)
+    tensorDataset = TweetDataset(input_ids, attention_masks, labels)
     train_loader = DataLoader(tensorDataset, batch_size=24, shuffle=True)
 
     for epoch in tqdm(range(10)):
