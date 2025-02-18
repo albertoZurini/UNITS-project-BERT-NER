@@ -89,27 +89,36 @@ def fix_labels(tokenized_inputs, bio_labels, debug=False):
 def training_step(dataset, model, optimizer, loss_fn, tokenizer, device):
     epoch_loss = 0
     for i, item in enumerate(dataset):
-        text = item["document"].to(device)
-        bio_labels = item["doc_bio_tags"].to(device)
-
-        labels = fix_labels(tokenized_inputs, bio_labels)
+        input_ids = item["input_ids"].to(device)
+        labels = item["labels"].to(device)
+        attention_mask = item["attention_mask"].to(device)
         
         # Forward pass (in training mode, labels are provided so the loss is computed)
-        output = model(tokenized_inputs.input_ids, tokenized_inputs.attention_mask)
+        output = model(input_ids, attention_mask)
 
-        output = output.permute(0, 2, 1).type(torch.float32)
-        labels = labels.permute(0, 2, 1).type(torch.float32)
+        output = output.type(torch.float32)
+        labels = labels.type(torch.float32)
+
+        output_masked = []
+        labels_masked = []
+        for i in range(output.size(0)):
+            seq_len = attention_mask[i].sum().item()
+            output_masked.append(output[i, :seq_len])
+            labels_masked.append(labels[i, :seq_len])
+
+        output_masked = torch.cat(output_masked, dim=0)  # Shape: (valid_tokens, num_classes)
+        labels_masked = torch.cat(labels_masked, dim=0)  # Shape: (valid_tokens,)
 
         optimizer.zero_grad()
 
-        loss = loss_fn(output, labels)
+        loss = loss_fn(output_masked, labels_masked)
         epoch_loss += loss
         
         loss.backward()
         optimizer.step()
     return epoch_loss
 
-class TweetDataset(torch.utils.data.Dataset):
+class MyDataset(torch.utils.data.Dataset):
     """
     Class to store the tweet data as PyTorch Dataset
     """
@@ -120,17 +129,32 @@ class TweetDataset(torch.utils.data.Dataset):
         self.labels = labels
         
     def __getitem__(self, idx):
-        # an encoding can have keys such as input_ids and attention_mask
-        # item is a dictionary which has the same keys as the encoding has
-        # and the values are the idxth value of the corresponding key (in PyTorch's tensor format)
-        item = {} #{key: torch.tensor(val) for key, val in self.encodings[idx].items()}
-        item["document"] = torch.tensor(self.encodings[idx])
-        item["attention_mask"] = torch.tensor(self.attention_masks[idx])
-        item['labels'] = torch.tensor(self.labels[idx])
-        return item
+
+        return {
+            "input_ids": torch.tensor(self.encodings[idx]),
+            "attention_mask": torch.tensor(self.attention_masks[idx]),
+            "labels": torch.tensor(self.labels[idx])
+        }
     
     def __len__(self):
         return len(self.labels)
+
+def collate(batch):
+    ips = [item['input_ids'][0] for item in batch]
+    attn = [item['attention_mask'][0] for item in batch]
+    lb = [item['labels'][0] for item in batch]
+
+    # Pad sequences to the same length
+    ips_padded = torch.nn.utils.rnn.pad_sequence(ips, batch_first=True, padding_value=0)
+    attn_padded = torch.nn.utils.rnn.pad_sequence(attn, batch_first=True, padding_value=0)
+    lb_padded = torch.nn.utils.rnn.pad_sequence(lb, batch_first=True, padding_value=-100)  # Common for loss masking
+
+    return {
+        'input_ids': ips_padded,
+        'attention_mask': attn_padded,
+        'labels': lb_padded
+    }
+
 
 # Example usage:
 if __name__ == "__main__":
@@ -138,7 +162,7 @@ if __name__ == "__main__":
     num_labels = 3  # For example, if you have tags like B, I, and O
     tokenizer = AutoTokenizer.from_pretrained(model_name)
 
-    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+    device = torch.device('cpu') # torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
     print("Device used: {}.".format(device))
 
     model = CustomTokenClassifier(model_name, num_labels)
@@ -169,9 +193,27 @@ if __name__ == "__main__":
 
     # train_loader = DataLoader(dataset["train"], batch_size=10, shuffle=True)
     # tensorDataset = TensorDataset(input_ids, attention_mask, labels)
-    tensorDataset = TweetDataset(input_ids, attention_masks, labels)
-    train_loader = DataLoader(tensorDataset, batch_size=24, shuffle=True)
+    tensorDataset = MyDataset(input_ids, attention_masks, labels)
+    train_loader = DataLoader(tensorDataset, batch_size=24, shuffle=True, collate_fn=collate)
 
     for epoch in tqdm(range(10)):
         loss = training_step(train_loader, model, optimizer, loss_fn, tokenizer, device)
         print(loss)
+
+    torch.save(model.state_dict(), 'model_weights.pth')
+
+"""
+To test:
+
+i = 1
+string_to_test = dataset["train"][i]["document"]
+bio_labels = dataset["train"][i]["doc_bio_tags"]
+
+tokenized_input = tokenizer(string_to_test, 
+                    is_split_into_words=True,
+                    return_tensors="pt"
+                    )
+label = fix_labels(tokenized_inputs[i], bio_labels)
+
+output = model(tokenized_input["input_ids"].to(device), tokenized_input["attention_mask"].to(device))
+"""
