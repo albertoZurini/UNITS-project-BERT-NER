@@ -14,7 +14,8 @@ class CustomTokenClassifier(nn.Module):
         self.dropout = nn.Dropout(dropout_prob)
         hidden_size = self.base_model.config.hidden_size
         # Define your own classification head: a linear layer mapping hidden states to num_labels
-        self.fc1 = nn.Linear(hidden_size, num_labels)
+        self.fc1 = nn.Linear(hidden_size, hidden_size)
+        self.fc2 = nn.Linear(hidden_size, num_labels)
         # Optionally, define a softmax layer (note: during training you usually pass logits to CrossEntropyLoss)
         self.softmax = nn.Softmax(dim=-1)
 
@@ -25,12 +26,14 @@ class CustomTokenClassifier(nn.Module):
             attention_mask=attention_mask
         )
         # Extract the last hidden states (shape: [batch_size, seq_length, hidden_size])
-        sequence_output = outputs.last_hidden_state
-        sequence_output = self.dropout(sequence_output)
-        logits = self.fc1(sequence_output)  # [batch_size, seq_length, num_labels]
+        x = outputs.last_hidden_state
+        x = self.dropout(x)
+        x = self.fc1(x)  # [batch_size, seq_length, num_labels]
+        x = torch.relu(x)
+        x = self.fc2(x)
         
         # Optionally, compute probabilities using softmax
-        return self.softmax(logits)        
+        return self.softmax(x)        
     
     def freeze_bert(self):
         """
@@ -115,6 +118,8 @@ def training_step(dataset, model, optimizer, loss_fn, tokenizer, device):
         epoch_loss += loss
         
         loss.backward()
+
+        pass
         optimizer.step()
     return epoch_loss
 
