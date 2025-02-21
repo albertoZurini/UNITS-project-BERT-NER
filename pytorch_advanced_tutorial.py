@@ -1,3 +1,6 @@
+# Taken from: https://pytorch.org/tutorials/beginner/nlp/advanced_tutorial.html
+# https://arxiv.org/pdf/1910.08840
+
 import torch
 from torch import nn
 from tqdm import tqdm
@@ -151,6 +154,14 @@ class BiLSTM_CRF(nn.Module):
         return path_score, best_path
 
     def neg_log_likelihood(self, sentence, tags):
+        # From the paper formula (9)
+        # p(y|f) = ( exp(s(f, y)) ) / (sum { exp(s(f, y')) })
+        # Numerator is the score calculated from the ground truth
+        # Denominator is the score calculated from the model's output
+        # Since we are computing the log likelihood, we are computing 
+        # -log(p(y|f)) = -log(exp(..) / sum(..)) = -log(exp(..)) - (-log(sum{..}))
+        # exp(..) is _score_sentence
+        # sum{..} is _forward_alg
         feats = self._get_lstm_features(sentence)
         forward_score = self._forward_alg(feats)
         gold_score = self._score_sentence(feats, tags)
@@ -211,6 +222,7 @@ for epoch in tqdm(range(
 
         # Step 3. Run our forward pass.
         loss = model.neg_log_likelihood(sentence_in, targets)
+        print(loss)
 
         # Step 4. Compute the loss, gradients, and update the parameters by
         # calling optimizer.step()
