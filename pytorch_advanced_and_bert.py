@@ -73,7 +73,7 @@ class BiLSTM_CRF(nn.Module):
         forward_var = init_alphas.to(self.device)
 
         # Iterate through the sentence
-        for feat in feats:
+        for feat in feats[0]:
             alphas_t = []  # The forward tensors at this timestep
             for next_tag in range(self.tagset_size):
                 # broadcast the emission score: it is the same regardless of
@@ -128,7 +128,7 @@ class BiLSTM_CRF(nn.Module):
 
         # forward_var at step i holds the viterbi variables for step i-1
         forward_var = init_vvars
-        for feat in feats:
+        for feat in feats[0]:
             bptrs_t = []  # holds the backpointers for this step
             viterbivars_t = []  # holds the viterbi variables for this step
 
