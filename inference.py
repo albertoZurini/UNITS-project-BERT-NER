@@ -41,7 +41,7 @@ def main():
       for sample in dataset:      
         # Tokenize the sample. Assumes the document is already split into words.
         
-        # sample = dataset[10]
+        sample = dataset[150]
         
         tokenized_input = tokenizer(sample["document"], 
                                     is_split_into_words=True,
@@ -57,21 +57,21 @@ def main():
         # Run inference.
         outputs = model.forward(input_ids, attention_mask)
         
-        # table_data = [
-        #     [
-        #         tokenizer.decode(input_ids[0][i]), 
-        #         outputs[1][i], 
-        #         ohe_to_bio(outputs[1][i]), 
-        #         labels[0][i].item()  # Convert tensor to python int.
-        #     ]
-        #     for i in range(len(outputs[1]))
-        # ]
-        # 
-        # headers = ["Token", "Output", "BIO Tag", "Label"]
-        # _out = tabulate(table_data, headers=headers, tablefmt="html")
-        # with open("table.html", "w") as f:
-        #   f.write(_out)
-        # return
+        table_data = [
+            [
+                tokenizer.decode(input_ids[0][i]), 
+                outputs[1][i], 
+                ohe_to_bio(outputs[1][i]), 
+                labels[0][i].item()  # Convert tensor to python int.
+            ]
+            for i in range(len(outputs[1]))
+        ]
+        
+        headers = ["Token", "Output", "BIO Tag", "Label"]
+        _out = tabulate(table_data, headers=headers, tablefmt="html")
+        with open("table.html", "w") as f:
+          f.write(_out)
+        return
         
         for true, pred in zip(outputs[1], labels[0]):
           # Calculate TP, FP, FN for each class
