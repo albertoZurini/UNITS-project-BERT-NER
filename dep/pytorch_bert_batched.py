@@ -9,7 +9,6 @@ from datasets import load_dataset
 from torch.optim import AdamW
 from tqdm import tqdm
 from torch.utils.data import DataLoader, TensorDataset
-from tabulate import tabulate
 
 def argmax(vec):
     # return the argmax as a python int
@@ -23,11 +22,9 @@ def prepare_sequence(seq, to_ix):
 
 
 # Compute log sum exp in a numerically stable way for the forward algorithm
-def log_sum_exp(vec):
-    max_score = vec[0, argmax(vec)]
-    max_score_broadcast = max_score.view(1, -1).expand(1, vec.size()[1])
-    return max_score + \
-        torch.log(torch.sum(torch.exp(vec - max_score_broadcast)))
+def log_sum_exp(vec, dim):
+    max_score = torch.max(vec, dim=dim, keepdim=True)[0]
+    return max_score + torch.log(torch.sum(torch.exp(vec - max_score), dim=dim))
 
 class BiLSTM_CRF(nn.Module):
 
@@ -43,7 +40,6 @@ class BiLSTM_CRF(nn.Module):
         self.hidden_dim = hidden_dim
 
         # Maps the output of the LSTM into tag space.
-        self.hidden2hidden = nn.Linear(hidden_dim, hidden_dim)
         self.hidden2tag = nn.Linear(hidden_dim, self.tagset_size)
 
         # Matrix of transition parameters.  Entry i,j is the score of
@@ -56,38 +52,31 @@ class BiLSTM_CRF(nn.Module):
         self.transitions.data[tag_to_ix[START_TAG], :] = -10000
         self.transitions.data[:, tag_to_ix[STOP_TAG]] = -10000
 
-    def _forward_alg(self, feats):
-        # Do the forward algorithm to compute the partition function
-        # Questo vettore tiene i logaritmi degli esponenziali, per questo gli mettiamo degli interi
-        init_alphas = torch.full((1, self.tagset_size), -10000.)
-        # START_TAG has all of the score.
-        # The START_TAG is assigned a score of 0., meaning the sequence must start from this tag.
-        # All other tags still have -10000., making them nearly impossible as initial tags.
-        init_alphas[0][self.tag_to_ix[START_TAG]] = 0.
+        self.hidden = self.init_hidden()
 
-        # Wrap in a variable so that we will get automatic backprop
-        forward_var = init_alphas.to(self.device)
+    def init_hidden(self):
+        return (torch.randn(2, 1, self.hidden_dim // 2),
+                torch.randn(2, 1, self.hidden_dim // 2))
 
-        # Iterate through the sentence
-        for feat in feats[0]:
-            alphas_t = []  # The forward tensors at this timestep
-            for next_tag in range(self.tagset_size):
-                # broadcast the emission score: it is the same regardless of
-                # the previous tag
-                emit_score = feat[next_tag].view(
-                    1, -1).expand(1, self.tagset_size)
-                # the ith entry of trans_score is the score of transitioning to
-                # next_tag from i
-                trans_score = self.transitions[next_tag].view(1, -1)
-                # The ith entry of next_tag_var is the value for the
-                # edge (i -> next_tag) before we do log-sum-exp
-                next_tag_var = forward_var + trans_score + emit_score
-                # The forward variable for this tag is log-sum-exp of all the
-                # scores.
-                alphas_t.append(log_sum_exp(next_tag_var).view(1))
-            forward_var = torch.cat(alphas_t).view(1, -1)
-        terminal_var = forward_var + self.transitions[self.tag_to_ix[STOP_TAG]]
-        alpha = log_sum_exp(terminal_var)
+    def _forward_alg(self, feats, mask):
+        batch_size, seq_len, tagset_size = feats.size()
+        init_alphas = torch.full((batch_size, self.tagset_size), -10000.0, device=self.device)
+        init_alphas[:, self.tag_to_ix[START_TAG]] = 0.0
+        forward_var = init_alphas
+
+        for t in range(seq_len):
+            feat_t = feats[:, t, :]
+            mask_t = mask[:, t].unsqueeze(1)  # (batch_size, 1)
+            forward_expanded = forward_var.unsqueeze(2)
+            transitions = self.transitions.unsqueeze(0)
+            scores = forward_expanded + transitions
+            max_scores = torch.max(scores, dim=1, keepdim=True)[0]
+            log_sum_exp_scores = max_scores + torch.log(torch.sum(torch.exp(scores - max_scores), dim=1, keepdim=True))
+            log_sum_exp_scores = log_sum_exp_scores.squeeze(1) + feat_t
+            forward_var = torch.where(mask_t.bool(), log_sum_exp_scores, forward_var)
+
+        terminal_var = forward_var + self.transitions[self.tag_to_ix[STOP_TAG]].unsqueeze(0)
+        alpha = log_sum_exp(terminal_var, dim=1)
         return alpha
 
     def _get_lstm_features(self, input_ids, attention_mask):
@@ -101,27 +90,33 @@ class BiLSTM_CRF(nn.Module):
         self.hidden = outputs.last_hidden_state
 
         # lstm_out = lstm_out.view(len(input_ids), self.hidden_dim)
-        lstm_feats = self.hidden2hidden(self.hidden)
-        lstm_feats = torch.nn.ReLU(lstm_feats)
-        lstm_feats = self.hidden2tag(lstm_feats)
+        lstm_feats = self.hidden2tag(self.hidden)
         return lstm_feats
 
-    def _score_sentence(self, feats, tags):
-        # Gives the score of a provided tag sequence
-        score = torch.zeros(1).to(self.device)
-        tags = torch.cat([torch.tensor([self.tag_to_ix[START_TAG]], dtype=torch.long).to(self.device), tags])
-        for i, feat in enumerate(feats):
-            emission_score = feat[tags[i + 1]]
-            score = score + \
-                self.transitions[tags[i + 1], tags[i]] + emission_score
-        score = score + self.transitions[self.tag_to_ix[STOP_TAG], tags[-1]]
+    def _score_sentence(self, feats, tags, mask):
+        batch_size, seq_len = tags.size()
+        start_tags = torch.full((batch_size, 1), self.tag_to_ix[START_TAG], dtype=torch.long, device=self.device)
+        tags_with_start = torch.cat([start_tags, tags], dim=1)
+        score = torch.zeros(batch_size, device=self.device)
+
+        for t in range(seq_len):
+            current_tag = tags_with_start[:, t+1]
+            prev_tag = tags_with_start[:, t]
+            trans_score = self.transitions[current_tag, prev_tag]
+            emit_score = feats[:, t].gather(1, current_tag.unsqueeze(1)).squeeze(1)
+            valid = mask[:, t].float()
+            score += (trans_score + emit_score) * valid
+
+        last_tag = tags_with_start[:, -1]
+        stop_score = self.transitions[self.tag_to_ix[STOP_TAG], last_tag]
+        score += stop_score
         return score
 
     def _viterbi_decode(self, feats):
         backpointers = []
 
         # Initialize the viterbi variables in log space
-        init_vvars = torch.full((1, self.tagset_size), -10000.).to(self.device)
+        init_vvars = torch.full((1, self.tagset_size), -10000.)
         init_vvars[0][self.tag_to_ix[START_TAG]] = 0
 
         # forward_var at step i holds the viterbi variables for step i-1
@@ -162,18 +157,11 @@ class BiLSTM_CRF(nn.Module):
         return path_score, best_path
 
     def neg_log_likelihood(self, input_ids, attention_mask, tags):
-        # From the paper formula (9)
-        # p(y|f) = ( exp(s(f, y)) ) / (sum { exp(s(f, y')) })
-        # Numerator is the score calculated from the ground truth
-        # Denominator is the score calculated from the model's output
-        # Since we are computing the log likelihood, we are computing 
-        # -log(p(y|f)) = -log(exp(..) / sum(..)) = -log(exp(..)) - (-log(sum{..}))
-        # exp(..) is _score_sentence
-        # sum{..} is _forward_alg
         feats = self._get_lstm_features(input_ids, attention_mask)
-        forward_score = self._forward_alg(feats)
-        gold_score = self._score_sentence(feats[0], tags)
-        return forward_score - gold_score
+        mask = (attention_mask == 1)
+        forward_score = self._forward_alg(feats, mask)
+        gold_score = self._score_sentence(feats, tags, mask)
+        return (forward_score - gold_score).mean()
 
     def forward(self, input_ids, attention_mask):  # dont confuse this with _forward_alg above.
         # Get the emission scores from the BiLSTM
@@ -201,85 +189,47 @@ class BiLSTM_CRF(nn.Module):
 
 def bio_to_ohe(bio):
     if bio == "B":
-        return 0
+        return 0 # [1, 0, 0]
     elif bio == "I":
-        return 1
+        return 1 # [0, 1, 0]
     else:
-        return 2
-
-def ohe_to_bio(ohe):
-    if ohe == 0:
-        return "B"
-    elif ohe == 1:
-        return "I"
-    else:
-        return "O"
+        return 2 # [0, 0, 1]
 
 def fix_labels(tokenized_inputs, bio_labels, tokenizer, debug=False):
     word_ids = tokenized_inputs.word_ids()
-
     new_labels = []
     prev_word_idx = None
     for word_idx in word_ids:
         if word_idx is None:
-            # Special token (e.g. [CLS], [SEP]) get a dummy label (commonly -100 so they're ignored in loss)
-            new_labels.append(-100)
+            new_labels.append(2)  # Use 'O' for special tokens
         elif word_idx != prev_word_idx:
-            # First token of a new word: assign its original BIO tag.
             new_labels.append(bio_labels[word_idx])
         else:
-            # If the label starts with "B", change it to "I":
             label = bio_labels[word_idx]
             if label.startswith("B"):
                 label = label.replace("B", "I")
             new_labels.append(label)
         prev_word_idx = word_idx
 
-    if debug:
-        tokens = tokenizer.convert_ids_to_tokens(tokenized_inputs.input_ids.reshape(tokenized_inputs.input_ids.shape[1]))
-        for token, label in zip(tokens, new_labels):
-            print(f"{token:10s} -> {label}")
-
-    new_labels = [[bio_to_ohe(item) for item in new_labels]]
+    new_labels = [bio_to_ohe(label) for label in new_labels]
     new_labels = torch.tensor(new_labels)
-
     return new_labels
 
-def training_step(dataset, model : BiLSTM_CRF, optimizer, device):
-    epoch_loss = 0
-    for i, item in enumerate(dataset):
-        model.zero_grad()
-
-        batch_input_ids = item["input_ids"]
-        batch_labels = item["labels"]
-        batch_attention_mask = item["attention_mask"]
-
-        for j in range(len(batch_input_ids)):
-            input_ids = batch_input_ids[j]
-            labels = batch_labels[j]
-            attention_mask = batch_attention_mask[j]
-
-            length = (attention_mask == 1).sum().item()
-            input_ids = input_ids[:length]
-            labels = labels[:length]
-            attention_mask = attention_mask[:length]
-
-            input_ids = input_ids.unsqueeze(0)
-            # labels = labels.unsqueeze(0)
-            attention_mask = attention_mask.unsqueeze(0)
-            
-            input_ids = input_ids.to(device)
-            labels = labels.to(device)
-            attention_mask = attention_mask.to(device)
-            loss = model.neg_log_likelihood(input_ids, attention_mask, labels)
-            
-            loss.backward()
-            optimizer.step()
-            
-            epoch_loss += loss
+def training_step(dataloader, model, optimizer, loss_fn, tokenizer, device):
+    model.train()
+    total_loss = 0
+    for batch in dataloader:
+        optimizer.zero_grad()
+        input_ids = batch['input_ids'].to(device)
+        attention_mask = batch['attention_mask'].to(device)
+        labels = batch['labels'].to(device)
         
-        
-    return epoch_loss
+        loss = model.neg_log_likelihood(input_ids, attention_mask, labels)
+        loss.backward()
+        optimizer.step()
+        total_loss += loss.item()
+    
+    return total_loss / len(dataloader)
 
 class MyDataset(torch.utils.data.Dataset):
     """
@@ -338,7 +288,6 @@ if __name__ == "__main__":
                        embedding_dim=EMBEDDING_DIM,
                        device=device
                        )
-    model.load_state_dict(torch.load('model_weights.pth', weights_only=True))
     model.freeze_bert()
     model.to(device)
 
@@ -346,6 +295,8 @@ if __name__ == "__main__":
 
     dataset = load_dataset("midas/inspec", "extraction")
     
+    loss_fn = nn.BCELoss()
+
     tokenized_inputs = [tokenizer(dataset["train"][j]["document"], 
                         is_split_into_words=True,
                         return_tensors="pt"
@@ -361,32 +312,13 @@ if __name__ == "__main__":
         label = fix_labels(tokenized_inputs[i], bio_labels, tokenizer)
         labels.append(label)
 
+    # train_loader = DataLoader(dataset["train"], batch_size=10, shuffle=True)
+    # tensorDataset = TensorDataset(input_ids, attention_mask, labels)
     tensorDataset = MyDataset(input_ids, attention_masks, labels)
     train_loader = DataLoader(tensorDataset, batch_size=24, shuffle=True, collate_fn=collate)
 
-    for epoch in tqdm(range(100)):
-        loss = training_step(train_loader, model, optimizer, device)
+    for epoch in tqdm(range(10)):
+        loss = training_step(train_loader, model, optimizer, loss_fn, tokenizer, device)
         print(loss)
-        if epoch % 10 == 0:
-            torch.save(model.state_dict(), 'model_weights.pth')
+
     torch.save(model.state_dict(), 'model_weights.pth')
-
-    i = 0
-    input_ids = tensorDataset[i]["input_ids"].cuda()
-    attention_masks = tensorDataset[i]["attention_mask"].cuda()
-    labels = tensorDataset[i]["labels"]
-    outputs = model.forward(input_ids, attention_masks)
-
-    table_data = [
-        [tokenizer.decode(input_ids[0][i]), 
-        outputs[1][i], 
-        ohe_to_bio(outputs[1][i]), 
-        labels[0][i]]
-        for i in range(len(outputs[1]))
-    ]
-
-    # Define headers
-    headers = ["Token", "Output", "BIO Tag", "Label"]
-
-    # Print table with tabulate
-    tabulate(table_data, headers=headers, tablefmt="html")

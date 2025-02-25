@@ -1,33 +1,25 @@
-# Taken from: https://pytorch.org/tutorials/beginner/nlp/advanced_tutorial.html
-# https://arxiv.org/pdf/1910.08840
-
 import torch
 from torch import nn
-from tqdm import tqdm
-from transformers import AutoModel, AutoTokenizer
-from datasets import load_dataset
-from torch.optim import AdamW
-from tqdm import tqdm
-from torch.utils.data import DataLoader, TensorDataset
-from tabulate import tabulate
+from transformers import AutoModel
 
 def argmax(vec):
-    # return the argmax as a python int
+    # Return the argmax as a python int.
     _, idx = torch.max(vec, 1)
     return idx.item()
-
 
 def prepare_sequence(seq, to_ix):
     idxs = [to_ix[w] for w in seq]
     return torch.tensor(idxs, dtype=torch.long)
 
-
-# Compute log sum exp in a numerically stable way for the forward algorithm
+# Compute log sum exp in a numerically stable way for the forward algorithm.
 def log_sum_exp(vec):
     max_score = vec[0, argmax(vec)]
     max_score_broadcast = max_score.view(1, -1).expand(1, vec.size()[1])
-    return max_score + \
-        torch.log(torch.sum(torch.exp(vec - max_score_broadcast)))
+    return max_score + torch.log(torch.sum(torch.exp(vec - max_score_broadcast)))
+
+# Define special tags (used in the model).
+START_TAG = "<START>"
+STOP_TAG = "<STOP>"
 
 class BiLSTM_CRF(nn.Module):
 
@@ -43,7 +35,6 @@ class BiLSTM_CRF(nn.Module):
         self.hidden_dim = hidden_dim
 
         # Maps the output of the LSTM into tag space.
-        self.hidden2hidden = nn.Linear(hidden_dim, hidden_dim)
         self.hidden2tag = nn.Linear(hidden_dim, self.tagset_size)
 
         # Matrix of transition parameters.  Entry i,j is the score of
@@ -101,9 +92,7 @@ class BiLSTM_CRF(nn.Module):
         self.hidden = outputs.last_hidden_state
 
         # lstm_out = lstm_out.view(len(input_ids), self.hidden_dim)
-        lstm_feats = self.hidden2hidden(self.hidden)
-        lstm_feats = torch.nn.ReLU(lstm_feats)
-        lstm_feats = self.hidden2tag(lstm_feats)
+        lstm_feats = self.hidden2tag(self.hidden)
         return lstm_feats
 
     def _score_sentence(self, feats, tags):
@@ -198,195 +187,3 @@ class BiLSTM_CRF(nn.Module):
         """
         for param in self.base_model.named_parameters():
             param[1].requires_grad=True
-
-def bio_to_ohe(bio):
-    if bio == "B":
-        return 0
-    elif bio == "I":
-        return 1
-    else:
-        return 2
-
-def ohe_to_bio(ohe):
-    if ohe == 0:
-        return "B"
-    elif ohe == 1:
-        return "I"
-    else:
-        return "O"
-
-def fix_labels(tokenized_inputs, bio_labels, tokenizer, debug=False):
-    word_ids = tokenized_inputs.word_ids()
-
-    new_labels = []
-    prev_word_idx = None
-    for word_idx in word_ids:
-        if word_idx is None:
-            # Special token (e.g. [CLS], [SEP]) get a dummy label (commonly -100 so they're ignored in loss)
-            new_labels.append(-100)
-        elif word_idx != prev_word_idx:
-            # First token of a new word: assign its original BIO tag.
-            new_labels.append(bio_labels[word_idx])
-        else:
-            # If the label starts with "B", change it to "I":
-            label = bio_labels[word_idx]
-            if label.startswith("B"):
-                label = label.replace("B", "I")
-            new_labels.append(label)
-        prev_word_idx = word_idx
-
-    if debug:
-        tokens = tokenizer.convert_ids_to_tokens(tokenized_inputs.input_ids.reshape(tokenized_inputs.input_ids.shape[1]))
-        for token, label in zip(tokens, new_labels):
-            print(f"{token:10s} -> {label}")
-
-    new_labels = [[bio_to_ohe(item) for item in new_labels]]
-    new_labels = torch.tensor(new_labels)
-
-    return new_labels
-
-def training_step(dataset, model : BiLSTM_CRF, optimizer, device):
-    epoch_loss = 0
-    for i, item in enumerate(dataset):
-        model.zero_grad()
-
-        batch_input_ids = item["input_ids"]
-        batch_labels = item["labels"]
-        batch_attention_mask = item["attention_mask"]
-
-        for j in range(len(batch_input_ids)):
-            input_ids = batch_input_ids[j]
-            labels = batch_labels[j]
-            attention_mask = batch_attention_mask[j]
-
-            length = (attention_mask == 1).sum().item()
-            input_ids = input_ids[:length]
-            labels = labels[:length]
-            attention_mask = attention_mask[:length]
-
-            input_ids = input_ids.unsqueeze(0)
-            # labels = labels.unsqueeze(0)
-            attention_mask = attention_mask.unsqueeze(0)
-            
-            input_ids = input_ids.to(device)
-            labels = labels.to(device)
-            attention_mask = attention_mask.to(device)
-            loss = model.neg_log_likelihood(input_ids, attention_mask, labels)
-            
-            loss.backward()
-            optimizer.step()
-            
-            epoch_loss += loss
-        
-        
-    return epoch_loss
-
-class MyDataset(torch.utils.data.Dataset):
-    """
-    Class to store the tweet data as PyTorch Dataset
-    """
-    
-    def __init__(self, encodings, attention_masks, labels):
-        self.encodings = encodings
-        self.attention_masks = attention_masks
-        self.labels = labels
-        
-    def __getitem__(self, idx):
-
-        return {
-            "input_ids": torch.tensor(self.encodings[idx]),
-            "attention_mask": torch.tensor(self.attention_masks[idx]),
-            "labels": torch.tensor(self.labels[idx])
-        }
-    
-    def __len__(self):
-        return len(self.labels)
-
-def collate(batch):
-    ips = [item['input_ids'][0] for item in batch]
-    attn = [item['attention_mask'][0] for item in batch]
-    lb = [item['labels'][0] for item in batch]
-
-    # Pad sequences to the same length
-    ips_padded = torch.nn.utils.rnn.pad_sequence(ips, batch_first=True, padding_value=0)
-    attn_padded = torch.nn.utils.rnn.pad_sequence(attn, batch_first=True, padding_value=0)
-    lb_padded = torch.nn.utils.rnn.pad_sequence(lb, batch_first=True, padding_value=-100)  # Common for loss masking
-
-    return {
-        'input_ids': ips_padded,
-        'attention_mask': attn_padded,
-        'labels': lb_padded
-    }
-
-
-# Example usage:
-if __name__ == "__main__":
-    model_name = "answerdotai/ModernBERT-base"  # or any other pretrained model
-    num_labels = 3  # For example, if you have tags like B, I, and O
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-
-    device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
-    print("Device used: {}.".format(device))
-
-    START_TAG = "<START>"
-    STOP_TAG = "<STOP>"
-    EMBEDDING_DIM = 5
-    tag_to_ix = {"B": 0, "I": 1, "O": 2, START_TAG: 3, STOP_TAG: 4}
-
-    model = BiLSTM_CRF(model_name=model_name,
-                       tag_to_ix=tag_to_ix, 
-                       embedding_dim=EMBEDDING_DIM,
-                       device=device
-                       )
-    model.load_state_dict(torch.load('model_weights.pth', weights_only=True))
-    model.freeze_bert()
-    model.to(device)
-
-    optimizer = AdamW(model.parameters(), lr=27e-6)
-
-    dataset = load_dataset("midas/inspec", "extraction")
-    
-    tokenized_inputs = [tokenizer(dataset["train"][j]["document"], 
-                        is_split_into_words=True,
-                        return_tensors="pt"
-                        ) for j in range(len(dataset["train"]))]
-    
-    input_ids = [ti["input_ids"] for ti in tokenized_inputs]
-    attention_masks = [ti["attention_mask"] for ti in tokenized_inputs]
-
-    labels = []
-
-    for i, item in enumerate(dataset["train"]):
-        bio_labels = item["doc_bio_tags"]
-        label = fix_labels(tokenized_inputs[i], bio_labels, tokenizer)
-        labels.append(label)
-
-    tensorDataset = MyDataset(input_ids, attention_masks, labels)
-    train_loader = DataLoader(tensorDataset, batch_size=24, shuffle=True, collate_fn=collate)
-
-    for epoch in tqdm(range(100)):
-        loss = training_step(train_loader, model, optimizer, device)
-        print(loss)
-        if epoch % 10 == 0:
-            torch.save(model.state_dict(), 'model_weights.pth')
-    torch.save(model.state_dict(), 'model_weights.pth')
-
-    i = 0
-    input_ids = tensorDataset[i]["input_ids"].cuda()
-    attention_masks = tensorDataset[i]["attention_mask"].cuda()
-    labels = tensorDataset[i]["labels"]
-    outputs = model.forward(input_ids, attention_masks)
-
-    table_data = [
-        [tokenizer.decode(input_ids[0][i]), 
-        outputs[1][i], 
-        ohe_to_bio(outputs[1][i]), 
-        labels[0][i]]
-        for i in range(len(outputs[1]))
-    ]
-
-    # Define headers
-    headers = ["Token", "Output", "BIO Tag", "Label"]
-
-    # Print table with tabulate
-    tabulate(table_data, headers=headers, tablefmt="html")
