@@ -35,6 +35,7 @@ class BiLSTM_CRF(nn.Module):
         self.hidden_dim = hidden_dim
 
         # Maps the output of the LSTM into tag space.
+        self.hidden2hidden = nn.Linear(hidden_dim, hidden_dim)
         self.hidden2tag = nn.Linear(hidden_dim, self.tagset_size)
 
         # Matrix of transition parameters.  Entry i,j is the score of
@@ -91,8 +92,9 @@ class BiLSTM_CRF(nn.Module):
         )
         self.hidden = outputs.last_hidden_state
 
-        # lstm_out = lstm_out.view(len(input_ids), self.hidden_dim)
-        lstm_feats = self.hidden2tag(self.hidden)
+        lstm_feats = self.hidden2hidden(self.hidden)
+        lstm_feats = nn.ReLU(lstm_feats)
+        lstm_feats = self.hidden2tag(lstm_feats)
         return lstm_feats
 
     def _score_sentence(self, feats, tags):
