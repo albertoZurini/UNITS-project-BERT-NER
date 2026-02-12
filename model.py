@@ -1,9 +1,165 @@
 import torch
+from torch import nn
 from transformers import AutoModel
+from const import START_TAG, STOP_TAG
 
-class BERT_CRF(torch.nn.Module):
-    def __init(self, model_name):
+class BERT_CRF(nn.Module):
+    def __init(self, model_name, tag_to_idx):
         super(BERT_CRF, self).__init__()
 
+        self.tag_to_ix = tag_to_idx
+        self.tagset_size = len(tag_to_idx)
+
+        # Load BERT
         self.base_model = AutoModel.from_pretrained(model_name, reference_compile=True)
         self.hidden_dim = self.base_model.config.hidden_size
+
+        # Maps the output of the LSTM into tag space.
+        self.hidden2hidden = nn.Linear(self.hidden_dim, self.hidden_dim)
+        self.hidden2tag = nn.Linear(self.hidden_dim, self.tagset_size)
+
+        # Matrix of transition parameters.  Entry i,j is the score of
+        # transitioning *to* i *from* j.
+        self.transitions = nn.Parameter(torch.randn(self.tagset_size, self.tagset_size))
+
+        # These two statements enforce the constraint that we never transfer
+        # to the start tag and we never transfer from the stop tag
+        self.transitions.data[tag_to_idx[START_TAG], :] = -10000
+        self.transitions.data[:, tag_to_idx[STOP_TAG]] = -10000
+
+    def _forward_alg(self, feats):
+        # Do the forward algorithm to compute the partition function
+        # This vector contains the log of the exponents, so -10000 is like 0
+        init_alphas = torch.full((1, self.tagset_size), -10000.0)
+        # START_TAG has all of the score.
+        # The START_TAG is assigned a score of 0., meaning the sequence must start from this tag.
+        # All other tags still have -10000., making them nearly impossible as initial tags.
+        init_alphas[0][self.tag_to_ix[START_TAG]] = 0.0
+
+        # Wrap in a variable so that we will get automatic backprop
+        forward_var = init_alphas.to(self.device)
+
+        # Iterate through the sentence
+        for feat in feats[0]:
+            alphas_t = []  # The forward tensors at this timestep
+            for next_tag in range(self.tagset_size):
+                # broadcast the emission score: it is the same regardless of
+                # the previous tag
+                emit_score = feat[next_tag].view(1, -1).expand(1, self.tagset_size)
+                # the ith entry of trans_score is the score of transitioning to
+                # next_tag from i
+                trans_score = self.transitions[next_tag].view(1, -1)
+                # The ith entry of next_tag_var is the value for the
+                # edge (i -> next_tag) before we do log-sum-exp
+                next_tag_var = forward_var + trans_score + emit_score
+                # The forward variable for this tag is log-sum-exp of all the
+                # scores.
+                alphas_t.append(log_sum_exp(next_tag_var).view(1))
+            forward_var = torch.cat(alphas_t).view(1, -1)
+        terminal_var = forward_var + self.transitions[self.tag_to_ix[STOP_TAG]]
+        alpha = log_sum_exp(terminal_var)
+        return alpha
+
+    def _get_features(self, input_ids, attention_mask):
+        outputs = self.base_model(
+            input_ids=input_ids,
+            attention_mask=attention_mask
+        )
+        self.hidden = outputs.last_hidden_state
+
+        features = self.hidden2hidden(self.hidden)
+        features = nn.ReLU(features)
+        features = self.hidden2tag(features)
+        return features
+
+    def _score_sentence(self, feats, tags):
+        # Gives the score of a provided tag sequence
+        # Implementation of the equation 17.26 from the text book
+        score = torch.zeros(1).to(self.device)
+        tags = torch.cat([torch.tensor([self.tag_to_ix[START_TAG]], dtype=torch.long).to(self.device), tags])
+        for i, feat in enumerate(feats):
+            emission_score = feat[tags[i + 1]]
+            score = score + \
+                self.transitions[tags[i + 1], tags[i]] + emission_score
+        score = score + self.transitions[self.tag_to_ix[STOP_TAG], tags[-1]]
+        return score
+
+    def _viterbi_decode(self, feats):
+        backpointers = []
+
+        # Initialize the viterbi variables in log space
+        init_vvars = torch.full((1, self.tagset_size), -10000.).to(self.device)
+        init_vvars[0][self.tag_to_ix[START_TAG]] = 0
+
+        # forward_var at step i holds the viterbi variables for step i-1
+        forward_var = init_vvars
+        for feat in feats[0]:
+            bptrs_t = []  # holds the backpointers for this step
+            viterbivars_t = []  # holds the viterbi variables for this step
+
+            for next_tag in range(self.tagset_size):
+                # next_tag_var[i] holds the viterbi variable for tag i at the
+                # previous step, plus the score of transitioning
+                # from tag i to next_tag.
+                # We don't include the emission scores here because the max
+                # does not depend on them (we add them in below)
+                next_tag_var = forward_var + self.transitions[next_tag]
+                best_tag_id = argmax(next_tag_var)
+                bptrs_t.append(best_tag_id)
+                viterbivars_t.append(next_tag_var[0][best_tag_id].view(1))
+            # Now add in the emission scores, and assign forward_var to the set
+            forward_var = (torch.cat(viterbivars_t) + feat).view(1, -1)
+            backpointers.append(bptrs_t)
+
+        # Transition to STOP_TAG
+        terminal_var = forward_var + self.transitions[self.tag_to_ix[STOP_TAG]]
+        best_tag_id = argmax(terminal_var)
+        path_score = terminal_var[0][best_tag_id]
+        best_path = [best_tag_id]
+        for bptrs_t in reversed(backpointers):
+            best_tag_id = bptrs_t[best_tag_id]
+            best_path.append(best_tag_id)
+        # Reverse the backward path
+        best_path.reverse()
+        return path_score, best_path
+
+    def neg_log_likelihood(self, input_ids, attention_mask, tags):
+        # From the paper https://arxiv.org/pdf/1910.08840
+        # Formula (9)
+        # p(y|f) = ( exp(s(f, y)) ) / (sum { exp(s(f, y')) })
+        # Numerator is the score calculated from the ground truth
+        # Denominator is the score calculated from the model's output
+        # Since we are computing the log likelihood, we are computing
+        # -log(p(y|f)) = -log(exp(..) / sum(..)) = -log(exp(..)) - (-log(sum{..}))
+        # exp(..) is _score_sentence
+        # sum{..} is _forward_alg
+        feats = self._get_lstm_features(input_ids, attention_mask)
+        forward_score = self._forward_alg(feats)
+        gold_score = self._score_sentence(feats[0], tags)
+        return forward_score - gold_score
+
+    def forward(
+        self, input_ids, attention_mask
+    ):  # dont confuse this with _forward_alg above.
+        # Get the emission scores from the BiLSTM
+        lstm_feats = self._get_lstm_features(input_ids, attention_mask)
+
+        # Find the best path, given the features.
+        score, tag_seq = self._viterbi_decode(lstm_feats)
+        return score, tag_seq
+
+    def freeze_bert(self):
+        """
+        Freezes the parameters of BERT so when BertWithCustomNNClassifier is trained
+        only the wieghts of the custom classifier are modified.
+        """
+        for param in self.base_model.named_parameters():
+            param[1].requires_grad = False
+
+    def unfreeze_bert(self):
+        """
+        Unfreezes the parameters of BERT so when BertWithCustomNNClassifier is trained
+        both the wieghts of the custom classifier and of the underlying BERT are modified.
+        """
+        for param in self.base_model.named_parameters():
+            param[1].requires_grad = True
