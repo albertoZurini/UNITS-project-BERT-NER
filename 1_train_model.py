@@ -11,7 +11,7 @@ from datasets import load_dataset
 from collections import Counter
 
 # Assuming these are defined in your files
-from model import BiLSTM_CRF
+from model import BERT_CRF, START_TAG
 
 MODEL_NAME = "answerdotai/ModernBERT-base"
 BATCH_SIZE = 24
@@ -19,7 +19,7 @@ LR = 1e-6
 NUM_EPOCHS = 100
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-TAG_TO_IDX = {"B": 0, "I": 1, "O": 2}
+TAG_TO_IDX = {"B": 0, "I": 1, "O": 2, START_TAG: 3}
 IX_TO_TAG = {v: k for k, v in TAG_TO_IDX.items()}
 
 def get_word_level_bio_labels(example) -> List[int]:
@@ -59,7 +59,9 @@ class InspecDataset(Dataset):
         return len(self.labels)
 
     def __getitem__(self, idx):
-        item = {k: torch.tensor(v[idx]) for k, v in self.encodings.items()}
+        item = {}
+        item["input_ids"] = self.encodings[idx]["input_ids"][0]
+        item["attention_mask"] = self.encodings[idx]["attention_mask"][0]
         item["labels"] = torch.tensor(self.labels[idx])
         return item
 
@@ -84,7 +86,7 @@ def collate_fn(batch):
 
 @torch.no_grad()
 def evaluate_f1(
-    model: BiLSTM_CRF,
+    model: BERT_CRF,
     dataloader: DataLoader,
     dataset,  # original huggingface dataset
     tokenizer,
@@ -142,10 +144,11 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_NAME)
 
     # Model
-    model = BiLSTM_CRF(
+    model = BERT_CRF(
         model_name=MODEL_NAME,
         tag_to_idx=TAG_TO_IDX,
-    ).to(DEVICE)
+    )
+    model.to(DEVICE)
 
     if os.path.exists("model_weights.pth"):
         model.load_state_dict(torch.load("model_weights.pth", weights_only=True))
@@ -159,17 +162,20 @@ def main():
     # Training Data
     ds = load_dataset("midas/inspec", "extraction")["train"]
 
-    encodings = tokenizer(
-        ds["document"],
-        is_split_into_words=True,
-        padding=False,
-        truncation=True,
-        return_tensors="pt",
-    )
+    encodings = []
+    
+    for document in ds:
+        encodings.append(tokenizer(
+            document["document"],
+            is_split_into_words=True,
+            padding=False,
+            truncation=True,
+            return_tensors="pt",
+        ))
 
     aligned_labels = []
     for i in range(len(ds)):
-        word_ids = encodings.word_ids(batch_index=i)
+        word_ids = encodings[i].word_ids()[:-1] # Removing EOS
         word_labels = get_word_level_bio_labels(ds[i])
         aligned = align_labels_with_tokens(word_ids, word_labels)
         aligned_labels.append(aligned)
