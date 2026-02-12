@@ -62,7 +62,7 @@ def convert_example_to_processed(example: Dict, tokenizer: Any, device: torch.de
         "id": example["id"],
         "tokens": tokenized_document["input_ids"],
         "attention_mask": tokenized_document["attention_mask"],
-        "labels_onehot": labels_onehot,
+        "labels": labels_onehot,
     }
 
 
@@ -108,7 +108,7 @@ def main():
         print(f"{split}: {len(examples)} examples")
         if examples:
             print(
-                f"  Example shape of first labels_onehot: {examples[0]['labels_onehot'].shape}"
+                f"  Example shape of first labels: {examples[0]['labels'].shape}"
             )
 
 
