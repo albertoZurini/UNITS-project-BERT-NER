@@ -42,7 +42,7 @@ def bio_to_onehot(bio_tags: List[str]) -> np.ndarray:
     return onehot
 
 
-def convert_example_to_processed(example: Dict, tokenizer: Any, device: Any) -> Dict:
+def convert_example_to_processed(example: Dict, tokenizer: Any, device: torch.device) -> Dict:
     """
     Process one example from the dataset:
     - keep id and document (tokens)
@@ -66,7 +66,7 @@ def convert_example_to_processed(example: Dict, tokenizer: Any, device: Any) -> 
     }
 
 
-def process_split(dataset_split: Any, tokenizer: Any, device: Any) -> List[Dict]:
+def process_split(dataset_split: Any, tokenizer: Any, device: torch.device) -> List[Dict]:
     """
     Process an entire dataset split (train / validation / test)
     """
