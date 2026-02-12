@@ -1,35 +1,38 @@
-from datasets import load_dataset
+import torch
+from torch.utils.data import Dataset
+import torch.nn.utils.rnn
 
-# get entire dataset
-dataset = load_dataset("midas/inspec", "extraction")
+class MyDataset(Dataset):
+    """
+    Class to store the tweet data as a PyTorch Dataset.
+    """
+    def __init__(self, encodings, attention_masks, labels):
+        self.encodings = encodings
+        self.attention_masks = attention_masks
+        self.labels = labels
 
-# sample from the train split
-print("Sample from training dataset split")
-train_sample = dataset["train"][0]
-print("Fields in the sample: ", [key for key in train_sample.keys()])
-print("Tokenized Document: ", train_sample["document"])
-print("Document BIO Tags: ", train_sample["doc_bio_tags"])
-# print("Extractive/present Keyphrases: ", train_sample["extractive_keyphrases"])
-# print("Abstractive/absent Keyphrases: ", train_sample["abstractive_keyphrases"])
-print("\n-----------\n")
+    def __getitem__(self, idx):
+        return {
+            "input_ids": torch.tensor(self.encodings[idx]),
+            "attention_mask": torch.tensor(self.attention_masks[idx]),
+            "labels": torch.tensor(self.labels[idx])
+        }
 
-# sample from the validation split
-print("Sample from validation dataset split")
-validation_sample = dataset["validation"][0]
-print("Fields in the sample: ", [key for key in validation_sample.keys()])
-print("Tokenized Document: ", validation_sample["document"])
-print("Document BIO Tags: ", validation_sample["doc_bio_tags"])
-# print("Extractive/present Keyphrases: ", validation_sample["extractive_keyphrases"])
-# print("Abstractive/absent Keyphrases: ", validation_sample["abstractive_keyphrases"])
-print("\n-----------\n")
+    def __len__(self):
+        return len(self.labels)
 
-# sample from the test split
-print("Sample from test dataset split")
-test_sample = dataset["test"][0]
-print("Fields in the sample: ", [key for key in test_sample.keys()])
-print("Tokenized Document: ", test_sample["document"])
-print("Document BIO Tags: ", test_sample["doc_bio_tags"])
-# print("Extractive/present Keyphrases: ", test_sample["extractive_keyphrases"])
-# print("Abstractive/absent Keyphrases: ", test_sample["abstractive_keyphrases"])
-print("\n-----------\n")
+def collate(batch):
+    ips = [item['input_ids'][0] for item in batch]
+    attn = [item['attention_mask'][0] for item in batch]
+    lb = [item['labels'][0] for item in batch]
 
+    # Pad sequences to the same length.
+    ips_padded = torch.nn.utils.rnn.pad_sequence(ips, batch_first=True, padding_value=0)
+    attn_padded = torch.nn.utils.rnn.pad_sequence(attn, batch_first=True, padding_value=0)
+    lb_padded = torch.nn.utils.rnn.pad_sequence(lb, batch_first=True, padding_value=-100)
+    
+    return {
+        'input_ids': ips_padded,
+        'attention_mask': attn_padded,
+        'labels': lb_padded
+    }
