@@ -1,7 +1,6 @@
 import torch
 from torch import nn
 from transformers import AutoModel
-from const import START_TAG, STOP_TAG
 
 class BERT_CRF(nn.Module):
     def __init(self, model_name, tag_to_idx):
@@ -22,19 +21,10 @@ class BERT_CRF(nn.Module):
         # transitioning *to* i *from* j.
         self.transitions = nn.Parameter(torch.randn(self.tagset_size, self.tagset_size))
 
-        # These two statements enforce the constraint that we never transfer
-        # to the start tag and we never transfer from the stop tag
-        self.transitions.data[tag_to_idx[START_TAG], :] = -10000
-        self.transitions.data[:, tag_to_idx[STOP_TAG]] = -10000
-
     def _forward_alg(self, feats):
         # Do the forward algorithm to compute the partition function
         # This vector contains the log of the exponents, so -10000 is like 0
         init_alphas = torch.full((1, self.tagset_size), -10000.0)
-        # START_TAG has all of the score.
-        # The START_TAG is assigned a score of 0., meaning the sequence must start from this tag.
-        # All other tags still have -10000., making them nearly impossible as initial tags.
-        init_alphas[0][self.tag_to_ix[START_TAG]] = 0.0
 
         # Wrap in a variable so that we will get automatic backprop
         forward_var = init_alphas.to(self.device)
@@ -56,8 +46,7 @@ class BERT_CRF(nn.Module):
                 # scores.
                 alphas_t.append(log_sum_exp(next_tag_var).view(1))
             forward_var = torch.cat(alphas_t).view(1, -1)
-        terminal_var = forward_var + self.transitions[self.tag_to_ix[STOP_TAG]]
-        alpha = log_sum_exp(terminal_var)
+        alpha = log_sum_exp(forward_var)
         return alpha
 
     def _get_features(self, input_ids, attention_mask):
@@ -76,12 +65,10 @@ class BERT_CRF(nn.Module):
         # Gives the score of a provided tag sequence
         # Implementation of the equation 17.26 from the text book
         score = torch.zeros(1).to(self.device)
-        tags = torch.cat([torch.tensor([self.tag_to_ix[START_TAG]], dtype=torch.long).to(self.device), tags])
         for i, feat in enumerate(feats):
             emission_score = feat[tags[i + 1]]
             score = score + \
                 self.transitions[tags[i + 1], tags[i]] + emission_score
-        score = score + self.transitions[self.tag_to_ix[STOP_TAG], tags[-1]]
         return score
 
     def _viterbi_decode(self, feats):
@@ -89,7 +76,6 @@ class BERT_CRF(nn.Module):
 
         # Initialize the viterbi variables in log space
         init_vvars = torch.full((1, self.tagset_size), -10000.).to(self.device)
-        init_vvars[0][self.tag_to_ix[START_TAG]] = 0
 
         # forward_var at step i holds the viterbi variables for step i-1
         forward_var = init_vvars
@@ -112,9 +98,8 @@ class BERT_CRF(nn.Module):
             backpointers.append(bptrs_t)
 
         # Transition to STOP_TAG
-        terminal_var = forward_var + self.transitions[self.tag_to_ix[STOP_TAG]]
-        best_tag_id = argmax(terminal_var)
-        path_score = terminal_var[0][best_tag_id]
+        best_tag_id = argmax(forward_var)
+        path_score = forward_var[0][best_tag_id]
         best_path = [best_tag_id]
         for bptrs_t in reversed(backpointers):
             best_tag_id = bptrs_t[best_tag_id]
