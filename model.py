@@ -1,9 +1,31 @@
 import torch
 from torch import nn
 from transformers import AutoModel
+import torch.nn.functional as F
+
+START_TAG = "<START>"
+
+
+def argmax(vec):
+    # Return the argmax as a python int.
+    _, idx = torch.max(vec, 1)
+    return idx.item()
+
+
+def prepare_sequence(seq, to_ix):
+    idxs = [to_ix[w] for w in seq]
+    return torch.tensor(idxs, dtype=torch.long)
+
+
+# Compute log sum exp in a numerically stable way for the forward algorithm.
+def log_sum_exp(vec):
+    max_score = vec[0, argmax(vec)]
+    max_score_broadcast = max_score.view(1, -1).expand(1, vec.size()[1])
+    return max_score + torch.log(torch.sum(torch.exp(vec - max_score_broadcast)))
+
 
 class BERT_CRF(nn.Module):
-    def __init(self, model_name, tag_to_idx):
+    def __init__(self, model_name, tag_to_idx):
         super(BERT_CRF, self).__init__()
 
         self.tag_to_ix = tag_to_idx
@@ -23,7 +45,11 @@ class BERT_CRF(nn.Module):
 
         # These two statements enforce the constraint that we never transfer
         # to the start tag and we never transfer from the stop tag
-        # self.transitions.data[tag_to_idx[START_TAG], :] = -10000
+        self.transitions.data[tag_to_idx[START_TAG], :] = -10000
+
+    @property
+    def device(self):
+        return next(self.parameters()).device
 
     def _forward_alg(self, feats):
         # Do the forward algorithm to compute the partition function
@@ -54,18 +80,15 @@ class BERT_CRF(nn.Module):
                 # scores.
                 alphas_t.append(log_sum_exp(next_tag_var).view(1))
             forward_var = torch.cat(alphas_t).view(1, -1)
-        alpha = log_sum_exp(terminal_var)
+        alpha = log_sum_exp(forward_var)
         return alpha
 
     def _get_features(self, input_ids, attention_mask):
-        outputs = self.base_model(
-            input_ids=input_ids,
-            attention_mask=attention_mask
-        )
+        outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
         self.hidden = outputs.last_hidden_state
 
         features = self.hidden2hidden(self.hidden)
-        features = nn.ReLU(features)
+        features = F.relu(features)
         features = self.hidden2tag(features)
         return features
 
@@ -73,18 +96,24 @@ class BERT_CRF(nn.Module):
         # Gives the score of a provided tag sequence
         # Implementation of the equation 17.26 from the text book
         score = torch.zeros(1).to(self.device)
-        tags = torch.cat([torch.tensor([self.tag_to_ix[START_TAG]], dtype=torch.long).to(self.device), tags])
+        tags = torch.cat(
+            [
+                torch.tensor([self.tag_to_ix[START_TAG]], dtype=torch.long).to(
+                    self.device
+                ),
+                tags,
+            ]
+        )
         for i, feat in enumerate(feats):
             emission_score = feat[tags[i + 1]]
-            score = score + \
-                self.transitions[tags[i + 1], tags[i]] + emission_score
+            score = score + self.transitions[tags[i + 1], tags[i]] + emission_score
         return score
 
     def _viterbi_decode(self, feats):
         backpointers = []
 
         # Initialize the viterbi variables in log space
-        init_vvars = torch.full((1, self.tagset_size), -10000.).to(self.device)
+        init_vvars = torch.full((1, self.tagset_size), -10000.0).to(self.device)
         init_vvars[0][self.tag_to_ix[START_TAG]] = 0
 
         # forward_var at step i holds the viterbi variables for step i-1
@@ -128,7 +157,7 @@ class BERT_CRF(nn.Module):
         # -log(p(y|f)) = -log(exp(..) / sum(..)) = -log(exp(..)) - (-log(sum{..}))
         # exp(..) is _score_sentence
         # sum{..} is _forward_alg
-        feats = self._get_lstm_features(input_ids, attention_mask)
+        feats = self._get_features(input_ids, attention_mask)
         forward_score = self._forward_alg(feats)
         gold_score = self._score_sentence(feats[0], tags)
         return forward_score - gold_score
