@@ -101,7 +101,7 @@ class BERT_CRF(nn.Module):
                 torch.tensor([self.tag_to_ix[START_TAG]], dtype=torch.long).to(
                     self.device
                 ),
-                tags,
+                tags[0],
             ]
         )
         for i, feat in enumerate(feats):
