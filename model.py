@@ -55,6 +55,15 @@ class BERT_CRF(nn.Module):
         super().to(device)
         return self
 
+    def _get_features(self, input_ids, attention_mask):
+        outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
+        self.hidden = outputs.last_hidden_state
+
+        features = self.hidden2hidden(self.hidden)
+        features = F.relu(features)
+        features = self.hidden2tag(features)
+        return features
+
     def _forward_alg(self, feats, mask):
         """
         Calculate the partition function (log-sum-exp of all possible paths)
@@ -114,31 +123,46 @@ class BERT_CRF(nn.Module):
         # Final LogSumExp to get the total score for the sequence
         return torch.logsumexp(alpha, dim=1)
 
-    def _get_features(self, input_ids, attention_mask):
-        outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
-        self.hidden = outputs.last_hidden_state
+    def _score_sentence(self, feats, tags, mask):
+        """
+        Calculates the score of the ground truth path (numerator in log-likelihood).
+        This is the log-equivalent for equation 17.26 from the textbook.
+        """
+        batch_size, seq_len, _ = feats.shape
 
-        features = self.hidden2hidden(self.hidden)
-        features = F.relu(features)
-        features = self.hidden2tag(features)
-        return features
+        # We need to prepend the START_TAG to the tags sequence
+        # start_ids = torch.full(
+        #     (batch_size, 1),
+        #     self.tag_to_idx[START_TAG],
+        #     dtype=torch.long,
+        #     device=self.device,
+        # )
+        # tags_with_start = torch.cat([start_ids, tags], dim=1)
 
-    def _score_sentence(self, feats, tags):
-        # Gives the score of a provided tag sequence
-        # Implementation of the equation 17.26 from the text book
-        score = torch.zeros(1).to(self.device)
-        tags = torch.cat(
-            [
-                torch.tensor([self.tag_to_idx[START_TAG]], dtype=torch.long).to(
-                    self.device
-                ),
-                tags[0],
-            ]
-        )
-        for i, feat in enumerate(feats):
-            emission_score = feat[tags[i + 1]]
-            score = score + self.transitions[tags[i + 1], tags[i]] + emission_score
-            #                                ^ To         ^ From
+        # Initialize score
+        score = torch.zeros(batch_size, device=self.device)
+
+        # We can iterate or vectorize. Since we need to look up specific transitions,
+        # a loop over seq_len with gathering is usually efficient enough and readable.
+
+        for t in range(seq_len):
+            # Current tag (To) and Previous tag (From)
+            current_tags = tags[:, t + 1]  # (Batch)
+            prev_tags = tags[:, t]  # (Batch)
+
+            # Emission Score: feats[batch, t, current_tag]
+            # gather expects index to have same dims as input
+            emission = feats[:, t, :].gather(1, current_tags.unsqueeze(1)).squeeze(1)
+
+            # Transition Score: transitions[current_tag, prev_tag]
+            transition = self.transitions[current_tags, prev_tags]
+
+            # Add to score, but only if mask is active
+            step_score = emission + transition
+
+            # mask[:, t] is 1 for valid, 0 for pad
+            score = score + step_score * mask[:, t]
+
         return score
 
     def _viterbi_decode(self, feats):
@@ -191,8 +215,11 @@ class BERT_CRF(nn.Module):
         # sum{..} is _forward_alg
         feats = self._get_features(input_ids, attention_mask)
         forward_score = self._forward_alg(feats, attention_mask)
-        gold_score = self._score_sentence(feats[0], tags)
-        return forward_score - gold_score
+        gold_score = self._score_sentence(feats, tags, attention_mask)
+        
+        loss = forward_score - gold_score
+        
+        return loss.mean()
 
     def forward(
         self, input_ids, attention_mask
