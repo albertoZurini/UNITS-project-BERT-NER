@@ -51,6 +51,11 @@ class BERT_CRF(nn.Module):
     def device(self):
         return next(self.parameters()).device
 
+    def to(self, device: torch.device):
+        self.base_model.to(device)
+        super().to(device)
+        return self
+
     def _forward_alg(self, feats):
         # Do the forward algorithm to compute the partition function
         # This vector contains the log of the exponents, so -10000 is like 0
@@ -167,7 +172,7 @@ class BERT_CRF(nn.Module):
         self, input_ids, attention_mask
     ):  # dont confuse this with _forward_alg above.
         # Get the emission scores from the BiLSTM
-        lstm_feats = self._get_lstm_features(input_ids, attention_mask)
+        lstm_feats = self._get_features(input_ids, attention_mask)
 
         # Find the best path, given the features.
         score, tag_seq = self._viterbi_decode(lstm_feats)

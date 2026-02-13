@@ -16,7 +16,7 @@ from model import BERT_CRF, START_TAG
 MODEL_NAME = "answerdotai/ModernBERT-base"
 BATCH_SIZE = 1
 LR = 1e-6
-NUM_EPOCHS = 10
+NUM_EPOCHS = 0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 TAG_TO_IDX = {"B": 0, "I": 1, "O": 2, START_TAG: 3}
@@ -76,6 +76,8 @@ def evaluate_f1(
 
         # CRF decode
         _, predicted_tags = model(input_ids, attention_mask)  # assume returns best path
+        predicted_tags = torch.Tensor(predicted_tags).unsqueeze(0)
+        
 
         # We compare at token level (including subwords)
         for pred_seq, true_seq, mask in zip(
@@ -97,16 +99,20 @@ def evaluate_f1(
         return 0.0
 
     f1_scores = []
+    precisions = []
+    recalls = []
     for label in [0, 1, 2]:  # B, I, O
         p = TP[label] / (TP[label] + FP[label]) if TP[label] + FP[label] > 0 else 0
         r = TP[label] / (TP[label] + FN[label]) if TP[label] + FN[label] > 0 else 0
+        precisions.append(p)
+        recalls.append(r)
         f1 = 2 * p * r / (p + r) if p + r > 0 else 0
         f1_scores.append(f1)
 
     macro_f1 = sum(f1_scores) / len(f1_scores)
     print(f"Macro F1: {macro_f1:.4f}")
     for i, tag in enumerate(["B", "I", "O"]):
-        print(f"  {tag:2s}  P: {p:.3f}  R: {r:.3f}  F1: {f1_scores[i]:.3f}")
+        print(f"  {tag:2s}  P: {precisions[i]:.3f}  R: {recalls[i]:.3f}  F1: {f1_scores[i]:.3f}")
 
     return macro_f1
 
@@ -259,20 +265,7 @@ def main():
     # Test
     ds = load_dataset("midas/inspec", "extraction")["test"]
 
-    encodings = tokenizer(
-        ds["document"],
-        is_split_into_words=True,
-        padding=False,
-        truncation=True,
-        return_tensors="pt",
-    )
-
-    aligned_labels = []
-    for i in range(len(ds)):
-        word_ids = encodings.word_ids(batch_index=i)
-        word_labels = get_word_level_bio_labels(ds[i])
-        aligned = align_labels_with_tokens(word_ids, word_labels)
-        aligned_labels.append(aligned)
+    encodings, aligned_labels = get_encodings_and_aligned_labels(ds, tokenizer)
 
     dataset = InspecDataset(encodings, aligned_labels)
     loader = DataLoader(
