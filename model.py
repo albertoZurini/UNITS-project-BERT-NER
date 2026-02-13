@@ -28,7 +28,7 @@ class BERT_CRF(nn.Module):
     def __init__(self, model_name, tag_to_idx):
         super(BERT_CRF, self).__init__()
 
-        self.tag_to_ix = tag_to_idx
+        self.tag_to_idx = tag_to_idx
         self.tagset_size = len(tag_to_idx)
 
         # Load BERT
@@ -43,9 +43,8 @@ class BERT_CRF(nn.Module):
         # transitioning *to* i *from* j.
         self.transitions = nn.Parameter(torch.randn(self.tagset_size, self.tagset_size))
 
-        # These two statements enforce the constraint that we never transfer
-        # to the start tag and we never transfer from the stop tag
-        self.transitions.data[tag_to_idx[START_TAG], :] = -10000
+        # Enforce constraints: never transfer to START
+        self.transitions.data[self.tag_to_idx[START_TAG], :] = -10000
 
     @property
     def device(self):
@@ -56,37 +55,64 @@ class BERT_CRF(nn.Module):
         super().to(device)
         return self
 
-    def _forward_alg(self, feats):
-        # Do the forward algorithm to compute the partition function
-        # This vector contains the log of the exponents, so -10000 is like 0
-        init_alphas = torch.full((1, self.tagset_size), -10000.0)
-        # START_TAG has all of the score.
+    def _forward_alg(self, feats, mask):
+        """
+        Calculate the partition function (log-sum-exp of all possible paths)
+        in a vectorized manner for the batch.
+        """
+        batch_size, seq_len, tag_dim = feats.shape
+
+        # Initialize alpha (forward variables)
+        # Shape: (Batch_Size, Tag_Dim)
         # The START_TAG is assigned a score of 0., meaning the sequence must start from this tag.
         # All other tags still have -10000., making them nearly impossible as initial tags.
-        init_alphas[0][self.tag_to_ix[START_TAG]] = 0.0
+        alpha = torch.full((batch_size, tag_dim), -10000.0, device=self.device)
+        alpha[:, self.tag_to_idx[START_TAG]] = 0.0
 
-        # Wrap in a variable so that we will get automatic backprop
-        forward_var = init_alphas.to(self.device)
+        # Transpose transitions to match the broadcasting shape later
+        # We need (To, From), but for broadcasting usually (From, To) is easier
+        # depending on how we sum.
+        # Your definition: transitions[i, j] is To(i) From(j).
 
-        # Iterate through the sentence
-        for feat in feats[0]:
-            alphas_t = []  # The forward tensors at this timestep
-            for next_tag in range(self.tagset_size):
-                # broadcast the emission score: it is the same regardless of
-                # the previous tag
-                emit_score = feat[next_tag].view(1, -1).expand(1, self.tagset_size)
-                # the ith entry of trans_score is the score of transitioning to
-                # next_tag from i
-                trans_score = self.transitions[next_tag].view(1, -1)
-                # The ith entry of next_tag_var is the value for the
-                # edge (i -> next_tag) before we do log-sum-exp
-                next_tag_var = forward_var + trans_score + emit_score
-                # The forward variable for this tag is log-sum-exp of all the
-                # scores.
-                alphas_t.append(log_sum_exp(next_tag_var).view(1))
-            forward_var = torch.cat(alphas_t).view(1, -1)
-        alpha = log_sum_exp(forward_var)
-        return alpha
+        # Loop through the sequence
+        for t in range(seq_len):
+            # feats_t: (Batch_Size, Tag_Dim) -> Emission scores at step t
+            feats_t = feats[:, t, :]
+
+            # mask_t: (Batch_Size) -> 1 if valid token, 0 if padding
+            mask_t = mask[:, t].unsqueeze(1)
+
+            # Broadcasting to calculate scores for all transitions at once:
+            # alpha: (Batch, From, 1)
+            # feats_t: (Batch, 1, To)
+            # transitions: (1, To, From) (Wait, your definition is To, From)
+
+            # Let's align dimensions:
+            # alpha_prev: (Batch, From_Tags, 1)
+            alpha_prev = alpha.unsqueeze(2)
+
+            # emission: (Batch, 1, To_Tags)
+            emission = feats_t.unsqueeze(1)
+
+            # transitions: (1, From_Tags, To_Tags)
+            # Note: self.transitions is (To, From). We need (From, To) for the addition
+            # or we transpose the logic. Let's stick to your param definition:
+            # transitions[next_tag, prev_tag]
+            trans = self.transitions.T.unsqueeze(0)  # Shape (1, From, To)
+
+            # Score: (Batch, From, To)
+            next_tag_var = alpha_prev + trans + emission
+
+            # LogSumExp across the "From" dimension (dim=1) to get the score for reaching "To"
+            new_alpha = torch.logsumexp(next_tag_var, dim=1)
+
+            # Masking:
+            # If the token is valid (mask=1), we update alpha.
+            # If the token is padding (mask=0), we keep the old alpha (effectively skipping this step).
+            alpha = torch.where(mask_t > 0, new_alpha, alpha)
+
+        # Final LogSumExp to get the total score for the sequence
+        return torch.logsumexp(alpha, dim=1)
 
     def _get_features(self, input_ids, attention_mask):
         outputs = self.base_model(input_ids=input_ids, attention_mask=attention_mask)
@@ -103,7 +129,7 @@ class BERT_CRF(nn.Module):
         score = torch.zeros(1).to(self.device)
         tags = torch.cat(
             [
-                torch.tensor([self.tag_to_ix[START_TAG]], dtype=torch.long).to(
+                torch.tensor([self.tag_to_idx[START_TAG]], dtype=torch.long).to(
                     self.device
                 ),
                 tags[0],
@@ -120,7 +146,7 @@ class BERT_CRF(nn.Module):
 
         # Initialize the viterbi variables in log space
         init_vvars = torch.full((1, self.tagset_size), -10000.0).to(self.device)
-        init_vvars[0][self.tag_to_ix[START_TAG]] = 0
+        init_vvars[0][self.tag_to_idx[START_TAG]] = 0
 
         # forward_var at step i holds the viterbi variables for step i-1
         forward_var = init_vvars
@@ -164,7 +190,7 @@ class BERT_CRF(nn.Module):
         # exp(..) is _score_sentence
         # sum{..} is _forward_alg
         feats = self._get_features(input_ids, attention_mask)
-        forward_score = self._forward_alg(feats)
+        forward_score = self._forward_alg(feats, attention_mask)
         gold_score = self._score_sentence(feats[0], tags)
         return forward_score - gold_score
 

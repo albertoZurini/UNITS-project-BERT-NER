@@ -14,9 +14,9 @@ from collections import Counter
 from model import BERT_CRF, START_TAG
 
 MODEL_NAME = "answerdotai/ModernBERT-base"
-BATCH_SIZE = 1
+BATCH_SIZE = 24
 LR = 1e-6
-NUM_EPOCHS = 0
+NUM_EPOCHS = 10
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 TAG_TO_IDX = {"B": 0, "I": 1, "O": 2, START_TAG: 3}
