@@ -165,43 +165,64 @@ class BERT_CRF(nn.Module):
 
         return score
 
-    def _viterbi_decode(self, feats):
-        backpointers = []
+    def _viterbi_decode(self, feats, mask):
+        """
+        Decodes the best path. Loops over batch (standard for inference).
+        """
+        batch_size, seq_len, _ = feats.shape
+        result_paths = []
+        result_scores = []
 
-        # Initialize the viterbi variables in log space
-        init_vvars = torch.full((1, self.tagset_size), -10000.0).to(self.device)
-        init_vvars[0][self.tag_to_idx[START_TAG]] = 0
+        # Iterate over each sample in the batch
+        for b in range(batch_size):
+            # Get features for this sample
+            # We must shorten the sequence based on the mask to avoid decoding padding
+            valid_len = int(mask[b].sum().item())
+            sample_feats = feats[b, :valid_len, :]
+            
+            # Initialize viterbi variables
+            backpointers = []
+            
+            # Initialize forward variables in log space
+            init_vvars = torch.full((1, self.tagset_size), -10000.0, device=self.device)
+            init_vvars[0][self.tag_to_ix[START_TAG]] = 0
+            
+            forward_var = init_vvars
+            
+            for feat in sample_feats:
+                bptrs_t = [] 
+                viterbivars_t = [] 
 
-        # forward_var at step i holds the viterbi variables for step i-1
-        forward_var = init_vvars
-        for feat in feats[0]:
-            bptrs_t = []  # holds the backpointers for this step
-            viterbivars_t = []  # holds the viterbi variables for this step
+                for next_tag in range(self.tagset_size):
+                    # transitions is (To, From), forward_var is (1, From)
+                    # next_tag_var[i] = score(trans i -> next) + score(path to i)
+                    next_tag_var = forward_var + self.transitions[next_tag]
+                    best_tag_id = argmax(next_tag_var)
+                    bptrs_t.append(best_tag_id)
+                    viterbivars_t.append(next_tag_var[0][best_tag_id].view(1))
+                
+                forward_var = (torch.cat(viterbivars_t) + feat).view(1, -1)
+                backpointers.append(bptrs_t)
 
-            for next_tag in range(self.tagset_size):
-                # next_tag_var[i] holds the viterbi variable for tag i at the
-                # previous step, plus the score of transitioning
-                # from tag i to next_tag.
-                # We don't include the emission scores here because the max
-                # does not depend on them (we add them in below)
-                next_tag_var = forward_var + self.transitions[next_tag]
-                best_tag_id = argmax(next_tag_var)
-                bptrs_t.append(best_tag_id)
-                viterbivars_t.append(next_tag_var[0][best_tag_id].view(1))
-            # Now add in the emission scores, and assign forward_var to the set
-            forward_var = (torch.cat(viterbivars_t) + feat).view(1, -1)
-            backpointers.append(bptrs_t)
+            # Termination
+            best_tag_id = argmax(forward_var)
+            path_score = forward_var[0][best_tag_id]
+            
+            # Follow backpointers
+            best_path = [best_tag_id]
+            for bptrs_t in reversed(backpointers):
+                best_tag_id = bptrs_t[best_tag_id]
+                best_path.append(best_tag_id)
+            
+            # Pop off the start tag (implicit) and reverse
+            start = best_path.pop() 
+            best_path.reverse()
+            
+            result_scores.append(path_score)
+            result_paths.append(best_path)
+            
+        return result_scores, result_paths
 
-        # Transition to STOP_TAG
-        best_tag_id = argmax(forward_var)
-        path_score = forward_var[0][best_tag_id]
-        best_path = [best_tag_id]
-        for bptrs_t in reversed(backpointers):
-            best_tag_id = bptrs_t[best_tag_id]
-            best_path.append(best_tag_id)
-        # Reverse the backward path
-        best_path.reverse()
-        return path_score, best_path
 
     def neg_log_likelihood(self, input_ids, attention_mask, tags):
         # From the paper https://arxiv.org/pdf/1910.08840
@@ -225,10 +246,10 @@ class BERT_CRF(nn.Module):
         self, input_ids, attention_mask
     ):  # dont confuse this with _forward_alg above.
         # Get the emission scores from the BiLSTM
-        lstm_feats = self._get_features(input_ids, attention_mask)
+        feats = self._get_features(input_ids, attention_mask)
 
         # Find the best path, given the features.
-        score, tag_seq = self._viterbi_decode(lstm_feats)
+        score, tag_seq = self._viterbi_decode(feats, attention_mask)
         return score, tag_seq
 
     def freeze_bert(self):
