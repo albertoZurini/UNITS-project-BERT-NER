@@ -22,33 +22,6 @@ DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 TAG_TO_IDX = {"B": 0, "I": 1, "O": 2, START_TAG: 3}
 IX_TO_TAG = {v: k for k, v in TAG_TO_IDX.items()}
 
-def get_word_level_bio_labels(example) -> List[int]:
-    """Convert string BIO tags → integer labels"""
-    mapping = {"B": 0, "I": 1, "O": 2}
-    return [mapping[tag] for tag in example["doc_bio_tags"]]
-
-
-def align_labels_with_tokens(
-    word_ids: List[int | None],
-    word_level_labels: List[int],
-) -> List[int]:
-    """Standard word-piece label alignment: -100 on special tokens & subwords"""
-    aligned = []
-    prev_word_idx = None
-
-    for word_idx in word_ids:
-        if word_idx is None:
-            aligned.append(-100)
-        elif word_idx != prev_word_idx:
-            aligned.append(word_level_labels[word_idx])
-        else:
-            # subword → copy previous label (most common choice for NER)
-            # You could also do: if original was B → make it I
-            aligned.append(word_level_labels[word_idx])
-        prev_word_idx = word_idx
-
-    return aligned
-
 
 class InspecDataset(Dataset):
     def __init__(self, encodings: List[Dict], labels: List[List[int]]):
@@ -60,8 +33,8 @@ class InspecDataset(Dataset):
 
     def __getitem__(self, idx):
         item = {}
-        item["input_ids"] = self.encodings[idx]["input_ids"][0]
-        item["attention_mask"] = self.encodings[idx]["attention_mask"][0]
+        item["input_ids"] = self.encodings[idx]["input_ids"]
+        item["attention_mask"] = self.encodings[idx]["attention_mask"]
         item["labels"] = torch.tensor(self.labels[idx])
         return item
 
@@ -138,6 +111,66 @@ def evaluate_f1(
     return macro_f1
 
 
+def get_word_level_bio_labels(bio_tags) -> List[int]:
+    """Convert string BIO tags → integer labels"""
+    return [TAG_TO_IDX[tag] for tag in bio_tags["doc_bio_tags"]]
+
+
+def align_labels_with_tokens(
+    word_ids: List[int | None],
+    word_level_labels: List[int],
+) -> List[int]:
+    """Standard word-piece label alignment: -100 on special tokens & subwords"""
+    aligned = []
+    prev_word_idx = None
+
+    for word_idx in word_ids:
+        if word_idx is None:
+            aligned.append(-100)
+        elif word_idx != prev_word_idx:
+            aligned.append(word_level_labels[word_idx])
+        else:
+            # subword → copy previous label (most common choice for NER)
+            # You could also do: if original was B → make it I
+            aligned.append(word_level_labels[word_idx])
+        prev_word_idx = word_idx
+
+    return aligned
+
+
+def get_encodings_and_aligned_labels(ds, tokenizer):
+    """
+    When a string is tokenized, there's no 1:1 mapping between a word and a token.
+    Sometimes a word is being tokenized with more than 1 token.
+    This is why we have to align the BIO labels to the encodings.
+    """
+    encodings = []
+    aligned_labels = []
+
+    for document in ds:
+        tokenized_input = tokenizer(
+            document["document"],
+            is_split_into_words=True,
+            padding=False,
+            truncation=True,
+            return_tensors="pt",
+        )
+
+        encodings.append({
+            "input_ids": tokenized_input["input_ids"][0],
+            "attention_mask": tokenized_input["attention_mask"][0]
+        })
+
+        word_ids = (
+            tokenized_input.word_ids()
+        )  # This array tells us which input_id belongs to which word
+        word_labels = get_word_level_bio_labels(document)
+        aligned = align_labels_with_tokens(word_ids, word_labels)
+        aligned_labels.append(aligned)
+
+    return encodings, aligned_labels
+
+
 def main():
     print(f"Using device: {DEVICE}")
 
@@ -162,30 +195,25 @@ def main():
     # Training Data
     ds = load_dataset("midas/inspec", "extraction")["train"]
 
-    encodings = []
-    
-    for document in ds:
-        encodings.append(tokenizer(
-            document["document"],
-            is_split_into_words=True,
-            padding=False,
-            truncation=True,
-            return_tensors="pt",
-        ))
+    encodings, aligned_labels = get_encodings_and_aligned_labels(ds, tokenizer)
+    # sanity check: same number of examples
+    assert len(encodings) == len(
+        aligned_labels
+    ), f"Number of encodings ({len(encodings)}) != number of label lists ({len(aligned_labels)})"
 
-    aligned_labels = []
-    for i in range(len(ds)):
-        word_ids = encodings[i].word_ids()[:-1] # Removing EOS
-        word_labels = get_word_level_bio_labels(ds[i])
-        aligned = align_labels_with_tokens(word_ids, word_labels)
-        aligned_labels.append(aligned)
+    # find first mismatch (if any) and raise with informative message
+    for i, (enc, lbl) in enumerate(zip(encodings, aligned_labels)):
+        if len(enc["input_ids"]) != len(lbl):
+            raise AssertionError(
+                f"Length mismatch at index {i}: encodings length={len(enc)} vs labels length={len(lbl)}"
+            )
 
     dataset = InspecDataset(encodings, aligned_labels)
     loader = DataLoader(
         dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
-        collate_fn=collate_fn,
+        # collate_fn=collate_fn,
         num_workers=2,
         pin_memory=True,
     )

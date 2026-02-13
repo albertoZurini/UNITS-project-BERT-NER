@@ -107,6 +107,7 @@ class BERT_CRF(nn.Module):
         for i, feat in enumerate(feats):
             emission_score = feat[tags[i + 1]]
             score = score + self.transitions[tags[i + 1], tags[i]] + emission_score
+            #                                ^ To         ^ From
         return score
 
     def _viterbi_decode(self, feats):
