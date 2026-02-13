@@ -130,22 +130,13 @@ class BERT_CRF(nn.Module):
         """
         batch_size, seq_len, _ = feats.shape
 
-        # We need to prepend the START_TAG to the tags sequence
-        # start_ids = torch.full(
-        #     (batch_size, 1),
-        #     self.tag_to_idx[START_TAG],
-        #     dtype=torch.long,
-        #     device=self.device,
-        # )
-        # tags_with_start = torch.cat([start_ids, tags], dim=1)
-
         # Initialize score
         score = torch.zeros(batch_size, device=self.device)
 
         # We can iterate or vectorize. Since we need to look up specific transitions,
         # a loop over seq_len with gathering is usually efficient enough and readable.
 
-        for t in range(seq_len):
+        for t in range(seq_len-1):
             # Current tag (To) and Previous tag (From)
             current_tags = tags[:, t + 1]  # (Batch)
             prev_tags = tags[:, t]  # (Batch)
@@ -185,7 +176,7 @@ class BERT_CRF(nn.Module):
             
             # Initialize forward variables in log space
             init_vvars = torch.full((1, self.tagset_size), -10000.0, device=self.device)
-            init_vvars[0][self.tag_to_ix[START_TAG]] = 0
+            init_vvars[0][self.tag_to_idx[START_TAG]] = 0
             
             forward_var = init_vvars
             

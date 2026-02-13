@@ -16,7 +16,7 @@ from model import BERT_CRF, START_TAG
 MODEL_NAME = "answerdotai/ModernBERT-base"
 BATCH_SIZE = 24
 LR = 1e-6
-NUM_EPOCHS = 10
+NUM_EPOCHS = 0
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 TAG_TO_IDX = {"B": 0, "I": 1, "O": 2, START_TAG: 3}
@@ -48,7 +48,7 @@ def collate_fn(batch):
     attention_mask = nn.utils.rnn.pad_sequence(
         attention_mask, batch_first=True, padding_value=0
     )
-    labels = nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=-100)
+    labels = nn.utils.rnn.pad_sequence(labels, batch_first=True, padding_value=0) # Even if the padding is 0, the mask will remove it and not cause any interference with the BIO tags
 
     return {
         "input_ids": input_ids,
@@ -76,7 +76,7 @@ def evaluate_f1(
 
         # CRF decode
         _, predicted_tags = model(input_ids, attention_mask)  # assume returns best path
-        predicted_tags = torch.Tensor(predicted_tags).unsqueeze(0)
+        # predicted_tags = torch.Tensor(predicted_tags)
         
 
         # We compare at token level (including subwords)
@@ -88,7 +88,7 @@ def evaluate_f1(
                     continue
                 if t == -100:
                     continue
-                p, t = p.item(), t.item()
+                p, t = p, t.item()
                 if p == t:
                     TP[t] += 1
                 else:
